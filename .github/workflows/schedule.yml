@@ -1,0 +1,125 @@
+name: Desk 500 scheduler
+
+# This repository exists only to ring a bell.
+#
+# Free-plan PRIVATE repos run GitHub's cron on a best-effort basis and it
+# frequently never fires, so the private desk repo cannot schedule itself.
+# PUBLIC repos schedule normally and get unlimited Actions minutes - so this
+# public repo holds the alarm clock and pokes the private one over the API.
+#
+# Nothing sensitive lives here. No ledger, no positions, no reasoning: just
+# this file. The token sits in Actions Secrets, which stay encrypted even in
+# a public repository, and only `schedule` and `workflow_dispatch` can start
+# this workflow - neither is reachable by anyone but you.
+#
+# DO NOT add a `pull_request` trigger. Secrets plus fork pull requests is the
+# classic way to hand your token to a stranger.
+
+on:
+  schedule:
+    # Cron is always UTC, which is why there are two. 07:30 Berlin is 05:30
+    # UTC in summer and 06:30 UTC in winter, so both fire and the job below
+    # discards whichever one is not 07:00 Berlin time. That is how this stays
+    # aligned with the Xetra open across daylight saving without anyone
+    # remembering to edit it twice a year.
+    - cron: "30 5 * * *"
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Force a run now
+        default: daily
+        type: choice
+        options: [daily, monthly]
+
+permissions:
+  contents: write        # for the keepalive commit only
+
+concurrency:
+  group: desk-scheduler
+  cancel-in-progress: false
+
+jobs:
+  ring:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decide whether this is the real 07:30 Berlin run
+        id: when
+        run: |
+          HOUR=$(TZ=Europe/Berlin date +%H)
+          DOW=$(TZ=Europe/Berlin date +%u)     # 1=Mon .. 7=Sun
+          DOM=$(TZ=Europe/Berlin date +%d)
+          echo "Berlin time: $(TZ=Europe/Berlin date '+%Y-%m-%d %H:%M %Z') (dow=$DOW dom=$DOM)"
+
+          if [ -n "${{ inputs.mode }}" ]; then
+            echo "mode=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
+            echo "Manual run."
+            exit 0
+          fi
+
+          # Only the schedule that lands on 07:00 Berlin proceeds; the other
+          # one is the daylight-saving twin and exits quietly.
+          if [ "$HOUR" != "07" ]; then
+            echo "Not the 07:00 Berlin hour - this is the DST twin. Standing down."
+            echo "mode=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$DOM" = "01" ]; then
+            echo "mode=monthly" >> "$GITHUB_OUTPUT"
+          elif [ "$DOW" -ge 6 ]; then
+            echo "Weekend and not the 1st - the markets are shut."
+            echo "mode=skip" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=daily" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Poke the desk
+        if: steps.when.outputs.mode != 'skip'
+        env:
+          TOKEN: ${{ secrets.DESK_DISPATCH_TOKEN }}
+          MODE: ${{ steps.when.outputs.mode }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::DESK_DISPATCH_TOKEN is not set in this repository's secrets."
+            exit 1
+          fi
+          CODE=$(curl -sS -o /tmp/body.txt -w '%{http_code}' -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/DrMeneM/Broker_agents/actions/workflows/desk.yml/dispatches" \
+            -d "{\"ref\":\"main\",\"inputs\":{\"mode\":\"$MODE\"}}")
+          echo "HTTP $CODE"
+          cat /tmp/body.txt || true
+          # 204 No Content with an empty body is what success looks like here.
+          if [ "$CODE" != "204" ]; then
+            echo "::error::Dispatch failed (HTTP $CODE). 401 = token expired; 404 = token lost access to the repo, or desk.yml was renamed."
+            exit 1
+          fi
+          echo "Dispatched mode=$MODE to DrMeneM/Broker_agents."
+
+      - name: Keepalive
+        # GitHub disables scheduled workflows after 60 days of repository
+        # inactivity, and this repo would otherwise never change - it would
+        # quietly switch ITSELF off and the desk would go silent with no
+        # error anywhere. One authored commit a week prevents that. It is
+        # pushed with the PAT, so it is an ordinary authored push rather than
+        # a bot event whose status as "activity" is undocumented.
+        if: ${{ github.event_name == 'schedule' }}
+        env:
+          TOKEN: ${{ secrets.DESK_DISPATCH_TOKEN }}
+        run: |
+          DOW=$(TZ=Europe/Berlin date +%u)
+          if [ "$DOW" != "1" ]; then echo "Not Monday; no keepalive needed."; exit 0; fi
+          date -u '+%Y-%m-%dT%H:%M:%SZ  scheduler alive' > heartbeat.txt
+          git config user.name  "desk-scheduler"
+          git config user.email "desk-scheduler@users.noreply.github.com"
+          git add heartbeat.txt
+          git diff --staged --quiet && { echo "No change."; exit 0; }
+          git commit -m "keepalive $(date -u +%Y-%m-%d)"
+          git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
