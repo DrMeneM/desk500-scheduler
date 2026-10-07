@@ -17,13 +17,14 @@ name: Desk 500 scheduler
 
 on:
   schedule:
-    # Cron is always UTC, which is why there are two. 07:30 Berlin is 05:30
-    # UTC in summer and 06:30 UTC in winter, so both fire and the job below
-    # discards whichever one is not 07:00 Berlin time. That is how this stays
-    # aligned with the Xetra open across daylight saving without anyone
-    # remembering to edit it twice a year.
-    - cron: "30 5 * * *"
-    - cron: "30 6 * * *"
+    # Two early shots, off the top of the hour. GitHub delays scheduled runs
+    # by HOURS when it is busy - observed 5-7 h in Sept-Oct 2026 - and the old
+    # rule "only proceed if it is 07:xx in Berlin" then discarded every late
+    # run, so the desk only ran from its own backstop around midday and the
+    # 1 October monthly research never happened. Now every firing pokes the
+    # desk; the desk is idempotent per date, so a second poke only re-marks.
+    - cron: "17 1 * * *"
+    - cron: "47 2 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -60,13 +61,8 @@ jobs:
             exit 0
           fi
 
-          # Only the schedule that lands on 07:00 Berlin proceeds; the other
-          # one is the daylight-saving twin and exits quietly.
-          if [ "$HOUR" != "07" ]; then
-            echo "Not the 07:00 Berlin hour - this is the DST twin. Standing down."
-            echo "mode=skip" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          # No hour gate any more: a late firing still runs (see the cron note).
+          echo "Firing at Berlin hour $HOUR."
 
           if [ "$DOM" = "01" ]; then
             echo "mode=monthly" >> "$GITHUB_OUTPUT"
@@ -123,3 +119,4 @@ jobs:
           git diff --staged --quiet && { echo "No change."; exit 0; }
           git commit -m "keepalive $(date -u +%Y-%m-%d)"
           git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
+
